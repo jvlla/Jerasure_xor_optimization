@@ -1,63 +1,25 @@
-// Timing measurement utilities implementation.
-
+#include <stdio.h>
+#include <time.h>
 #include "timing.h"
-#include <stddef.h>
+#define LIMIT 100
 
-void
-timing_set(
-  struct timing * t)
+double timing_delta(struct timespec * t1, struct timespec * t2)
 {
-#ifdef USE_CLOCK
-  t->clock = clock();
-#else
-  gettimeofday(&t->tv, NULL);
-#endif
-}
+  static double timing_time = 0;
+  
+  if (timing_time == 0) {
+    // first time call timing_delta(), calculate the time spend by clock_gettime()
+    struct timespec time_out_begin, time_out_end, time_in_begin, time_in_end;
+    for (int i = 0; i < LIMIT; ++i)
+    {
+        clock_gettime(CLOCK_REALTIME, &time_out_begin);
+        clock_gettime(CLOCK_REALTIME, &time_in_begin);
+        clock_gettime(CLOCK_REALTIME, &time_in_end);
+        clock_gettime(CLOCK_REALTIME, &time_out_end);
+        timing_time += (double)(time_out_end.tv_nsec - time_out_begin.tv_nsec);
+    }
+    timing_time /= LIMIT;
+  }
 
-double
-timing_get(
-  struct timing * t)
-{
-#ifdef USE_CLOCK
-  // The clock_t type is an "arithmetic type", which could be
-  // integral, double, long double, or others.
-  //
-  // Add 0.0 to make it a double or long double, then divide (in
-  // double or long double), then convert to double for our purposes.
-  return (double) ((t->clock + 0.0) / CLOCKS_PER_SEC);
-#else
-  return (double) t->tv.tv_sec + ((double) t->tv.tv_usec) / 1000000.0;
-#endif
-}
-
-double
-timing_now()
-{
-#ifdef USE_CLOCK
-  return (double) ((clock() + 0.0) / CLOCKS_PER_SEC);
-#else
-  struct timeval tv;
-  gettimeofday(&tv, NULL);
-  return (double) tv.tv_sec + ((double) tv.tv_usec) / 1000000.0;
-#endif
-}
-
-double
-timing_delta(
-  struct timing * t1,
-  struct timing * t2)
-{
-#ifdef USE_CLOCK
-  // The clock_t type is an "arithmetic type", which could be
-  // integral, double, long double, or others.
-  //
-  // Subtract first, resulting in another clock_t, then add 0.0 to
-  // make it a double or long double, then divide (in double or long
-  // double), then convert to double for our purposes.
-  return (double) (((t2->clock - t1->clock) + 0.0) / CLOCKS_PER_SEC);
-#else
-  double const d2 = (double) t2->tv.tv_sec + ((double) t2->tv.tv_usec) / 1000000.0;
-  double const d1 = (double) t1->tv.tv_sec + ((double) t1->tv.tv_usec) / 1000000.0;
-  return d2 - d1;
-#endif
+  return (double)t2->tv_sec - t1->tv_sec + (t2->tv_nsec - t1->tv_nsec - timing_time) / 1e9;
 }

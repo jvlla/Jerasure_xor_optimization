@@ -21,6 +21,7 @@ LT_INIT([disable-static])
 AC_PROG_CC
 
 # Checks for libraries.
+AC_CHECK_LIB([pthread], [main])
 AC_CHECK_LIB([gf_complete], [gf_init_easy], [],
              [AC_MSG_FAILURE(
                [You need to have gf_complete installed.

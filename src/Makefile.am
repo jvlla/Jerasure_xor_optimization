@@ -1,7 +1,7 @@
 # Jerasure AM file
 
 AM_CPPFLAGS = -I$(top_srcdir)/include
-AM_CFLAGS = $(SIMD_FLAGS)
+AM_CFLAGS = -march=native
 
 lib_LTLIBRARIES = libJerasure.la
 libJerasure_la_SOURCES = galois.c jerasure.c reed_sol.c cauchy.c liberation.c

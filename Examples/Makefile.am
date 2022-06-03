@@ -1,7 +1,7 @@
 # Jerasure AM file
 
 AM_CPPFLAGS = -I$(top_srcdir)/include
-AM_CFLAGS = $(SIMD_FLAGS)
+AM_CFLAGS = -march=native
 
 bin_PROGRAMS = jerasure_01 \
                jerasure_02 \

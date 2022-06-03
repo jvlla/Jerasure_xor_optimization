@@ -47,16 +47,38 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#define __USE_GNU
+#include <sched.h>
+#include <pthread.h>
+#include <unistd.h>
 #include <assert.h>
+#include <stdbool.h>
 
 #include "galois.h"
 #include "jerasure.h"
 
 #define talloc(type, num) (type *) malloc(sizeof(type)*(num))
 
+struct thread_arg {
+  pthread_cond_t * pempty;
+  pthread_cond_t * pfill;
+  pthread_mutex_t * pmutex;
+  bool ready;
+  int size;
+  char ** ptrs;
+};
+
+int k_global;
+int m_global;
+int w_global;
+int packetsize_global;
+int ** schedule_global;
+
 static double jerasure_total_xor_bytes = 0;
 static double jerasure_total_gf_bytes = 0;
 static double jerasure_total_memcpy_bytes = 0;
+
+void * jerasure_do_scheduled_operations_thread(void * arg);
 
 void jerasure_print_matrix(int *m, int rows, int cols, int w)
 {
@@ -992,24 +1014,97 @@ int jerasure_schedule_decode_lazy(int k, int m, int w, int *bitmatrix, int *eras
                             char **data_ptrs, char **coding_ptrs, int size, int packetsize, 
                             int smart)
 {
-  int i, tdone;
+  static bool first_call = true;
+  int i, j;
   char **ptrs;
+  static char ***p_sub_ptrs;
   int **schedule;
- 
+  static int cpu_num;
+  static int shift_num;
+  static int shifts[2];
+  static pthread_cond_t *p_empties, *p_fills;
+  static pthread_mutex_t *p_mutexes;
+  static struct thread_arg *p_thread_args;
+  static pthread_t *p_ps;
+  int rc;
+  // cpu_set_t mask;
+  
   ptrs = set_up_ptrs_for_scheduled_decoding(k, m, erasures, data_ptrs, coding_ptrs);
-  if (ptrs == NULL) return -1;
-
+  if (ptrs == NULL) 
+    return -1;
   schedule = jerasure_generate_decoding_schedule(k, m, w, bitmatrix, erasures, smart);
   if (schedule == NULL) {
     free(ptrs);
     return -1;
   }
 
-  for (tdone = 0; tdone < size; tdone += packetsize*w) {
-  jerasure_do_scheduled_operations(ptrs, schedule, packetsize);
-    for (i = 0; i < k+m; i++) ptrs[i] += (packetsize*w);
+  if (first_call) {
+    cpu_num = (int) sysconf(_SC_NPROCESSORS_ONLN);
+    // cpu_num = 8;
+    // printf("use %d threads\n", cpu_num);
+    shifts[1] = size / (packetsize * w) / cpu_num;
+    shifts[0] = shifts[1] + 1;
+    shift_num = size / (packetsize * w) - cpu_num * shifts[1];
+
+    p_sub_ptrs = talloc(char **, cpu_num);
+    p_empties = talloc(pthread_cond_t, cpu_num);
+    p_fills = talloc(pthread_cond_t, cpu_num);
+    p_mutexes = talloc(pthread_mutex_t, cpu_num);
+    p_thread_args = talloc(struct thread_arg, cpu_num);
+    p_ps = talloc(pthread_t, cpu_num);
+    for (i = 0; i < cpu_num; i++) {
+      pthread_cond_init(&p_empties[i], NULL);
+      pthread_cond_init(&p_fills[i], NULL);
+      pthread_mutex_init(&p_mutexes[i], NULL);
+      p_thread_args[i].pempty = &p_empties[i];
+      p_thread_args[i].pfill = &p_fills[i];
+      p_thread_args[i].pmutex = &p_mutexes[i];
+      p_thread_args[i].ready = false;
+      rc = pthread_create(&p_ps[i], NULL, jerasure_do_scheduled_operations_thread, &p_thread_args[i]); assert(rc == 0);
+      // CPU_ZERO(&mask);
+      // CPU_SET(i, &mask);
+      // assert(!pthread_setaffinity_np(p[i], sizeof(cpu_set_t), &mask));
+    }
+
+    first_call = false;
   }
 
+  k_global = k;
+  m_global = m;
+  w_global = w;
+  packetsize_global = packetsize;
+  schedule_global = schedule;
+
+  for (i = 0; i < shift_num; i++) {
+    p_thread_args[i].size = shifts[0] * packetsize * w;
+    p_sub_ptrs[i] = talloc(char *, (k+m));
+    for (j = 0; j < k + m; j++) 
+      p_sub_ptrs[i][j] = ptrs[j] + i * shifts[0] * packetsize * w;
+    p_thread_args[i].ptrs = p_sub_ptrs[i];
+  }
+  for (i = shift_num; i < cpu_num; i++) {
+    p_thread_args[i].size = shifts[1] * packetsize * w;
+    p_sub_ptrs[i] = talloc(char *, (k+m));
+    for (j = 0; j < k + m ; j++) 
+      p_sub_ptrs[i][j] = ptrs[j] + (shift_num * shifts[0]+ (i - shift_num) * shifts[1]) * packetsize * w;
+    p_thread_args[i].ptrs = p_sub_ptrs[i];
+  }
+
+  for (i = 0; i < cpu_num; i++) {
+    pthread_mutex_lock(&p_mutexes[i]);
+    p_thread_args[i].ready = true;
+    pthread_cond_signal(&p_fills[i]);
+    pthread_mutex_unlock(&p_mutexes[i]);
+  }
+  for (i = 0; i < cpu_num; i++) {
+    pthread_mutex_lock(&p_mutexes[i]);
+    while (p_thread_args[i].ready)
+      pthread_cond_wait(&p_empties[i], &p_mutexes[i]);
+    pthread_mutex_unlock(&p_mutexes[i]);
+  }
+
+  for (i = 0; i < cpu_num; i++)
+    free(p_sub_ptrs[i]);
   jerasure_free_schedule(schedule);
   free(ptrs);
 
@@ -1203,45 +1298,1061 @@ void jerasure_get_stats(double *fill_in)
   jerasure_total_memcpy_bytes = 0;
 }
 
+void * jerasure_do_scheduled_operations_thread(void * arg) {
+  struct thread_arg * p_thread_arg = (struct thread_arg *) arg;
+  int i, tdone;
+
+  while (true) {
+    pthread_mutex_lock(p_thread_arg->pmutex);
+    while(!p_thread_arg->ready)
+      pthread_cond_wait(p_thread_arg->pfill, p_thread_arg->pmutex);
+    p_thread_arg->ready = false;
+    pthread_cond_signal(p_thread_arg->pempty);
+    // doing coding
+    for (tdone = 0; tdone < p_thread_arg->size; tdone += packetsize_global*w_global) {
+      jerasure_do_scheduled_operations(p_thread_arg->ptrs, schedule_global, packetsize_global);
+      for (i = 0; i < k_global+m_global; i++) 
+        p_thread_arg->ptrs[i] += packetsize_global*w_global;
+    }
+    pthread_mutex_unlock(p_thread_arg->pmutex);
+  }
+}
+
 void jerasure_do_scheduled_operations(char **ptrs, int **operations, int packetsize)
 {
   char *sptr;
   char *dptr;
-  int op;
+  char * prev_dptr;
+  int op, i;
 
-  for (op = 0; operations[op][0] >= 0; op++) {
-    sptr = ptrs[operations[op][0]] + operations[op][1]*packetsize;
-    dptr = ptrs[operations[op][2]] + operations[op][3]*packetsize;
-    if (operations[op][4]) {
+if (packetsize >= 64) {
+#ifdef __AVX512F__
+    // to get better performance, when zmm capacity can support, use alignment memory mov rather than just xor 
+    if (packetsize == 64) {
+      for (i = 0; i < packetsize; i += 64) {
+        prev_dptr = NULL;
+        for (op = 0; operations[op][0] >= 0; op++) {
+          sptr = ptrs[operations[op][0]] + operations[op][1]*packetsize + i;
+          dptr = ptrs[operations[op][2]] + operations[op][3]*packetsize + i;
+          if (operations[op][4]) {
+            // do xor operations here
+            __asm__ __volatile__ (
+              "vmovdqa64     (%0), %%zmm0\n\t"
+              "vpxord     %%zmm0 , %%zmm8 , %%zmm8 \n\t"
+              :
+              : "r"(sptr), "r"(dptr)
+            );
+            // jerasure_total_xor_bytes += 512;
+          } else {
+            // write previous result to memory and copy current data to zmm registers
+            if (prev_dptr != NULL) {
+              __asm__ __volatile__ (
+                "vmovdqa64  %%zmm8 ,    (%1)\n\t"
+                :
+                : "r"(sptr), "r"(prev_dptr)
+              );
+            }
+            __asm__ __volatile__ (
+              "vmovdqa64     (%0), %%zmm8 \n\t"
+              :
+              : "r"(sptr), "r"(dptr)
+            );
+            // jerasure_total_memcpy_bytes += 512;
+          }
+          prev_dptr = dptr;
+        }
+        // write last result to memory
+        __asm__ __volatile__ (
+          "vmovdqa64  %%zmm8 ,    (%1)\n\t"
+          :
+          : "r"(sptr), "r"(prev_dptr)
+        );
+      }
+    } else if (packetsize <= 128) {
+      for (i = 0; i < packetsize; i += 128) {
+        prev_dptr = NULL;
+        for (op = 0; operations[op][0] >= 0; op++) {
+          sptr = ptrs[operations[op][0]] + operations[op][1]*packetsize + i;
+          dptr = ptrs[operations[op][2]] + operations[op][3]*packetsize + i;
+          if (operations[op][4]) {
+            // do xor operations here
+            __asm__ __volatile__ (
+              "vmovdqa64     (%0), %%zmm0\n\t"
+              "vmovdqa64   64(%0), %%zmm1\n\t"
+              "vpxord     %%zmm0 , %%zmm8 , %%zmm8 \n\t"
+              "vpxord     %%zmm1 , %%zmm9 , %%zmm9 \n\t"
+              :
+              : "r"(sptr), "r"(dptr)
+            );
+            // jerasure_total_xor_bytes += 512;
+          } else {
+            // write previous result to memory and copy current data to zmm registers
+            if (prev_dptr != NULL) {
+              __asm__ __volatile__ (
+                "vmovdqa64  %%zmm8 ,    (%1)\n\t"
+                "vmovdqa64  %%zmm9 ,  64(%1)\n\t"
+                :
+                : "r"(sptr), "r"(prev_dptr)
+              );
+            }
+            __asm__ __volatile__ (
+              "vmovdqa64     (%0), %%zmm8 \n\t"
+              "vmovdqa64   64(%0), %%zmm9 \n\t"
+              :
+              : "r"(sptr), "r"(dptr)
+            );
+            // jerasure_total_memcpy_bytes += 512;
+          }
+          prev_dptr = dptr;
+        }
+        // write last result to memory
+        __asm__ __volatile__ (
+          "vmovdqa64  %%zmm8 ,    (%1)\n\t"
+          "vmovdqa64  %%zmm9 ,  64(%1)\n\t"
+          :
+          : "r"(sptr), "r"(prev_dptr)
+        );
+      }
+    } else if (packetsize <= 256) {
+      for (i = 0; i < packetsize; i += 256) {
+        prev_dptr = NULL;
+        for (op = 0; operations[op][0] >= 0; op++) {
+          sptr = ptrs[operations[op][0]] + operations[op][1]*packetsize + i;
+          dptr = ptrs[operations[op][2]] + operations[op][3]*packetsize + i;
+          if (operations[op][4]) {
+            // do xor operations here
+            __asm__ __volatile__ (
+              "vmovdqa64     (%0), %%zmm0\n\t"
+              "vmovdqa64   64(%0), %%zmm1\n\t"
+              "vmovdqa64  128(%0), %%zmm2\n\t"
+              "vmovdqa64  192(%0), %%zmm3\n\t"
+              "vpxord     %%zmm0 , %%zmm8 , %%zmm8 \n\t"
+              "vpxord     %%zmm1 , %%zmm9 , %%zmm9 \n\t"
+              "vpxord     %%zmm2 , %%zmm10, %%zmm10\n\t"
+              "vpxord     %%zmm3 , %%zmm11, %%zmm11\n\t"
+              :
+              : "r"(sptr), "r"(dptr)
+            );
+            // jerasure_total_xor_bytes += 512;
+          } else {
+            // write previous result to memory and copy current data to zmm registers
+            if (prev_dptr != NULL) {
+              __asm__ __volatile__ (
+                "vmovdqa64  %%zmm8 ,    (%1)\n\t"
+                "vmovdqa64  %%zmm9 ,  64(%1)\n\t"
+                "vmovdqa64  %%zmm10, 128(%1)\n\t"
+                "vmovdqa64  %%zmm11, 192(%1)\n\t"
+                :
+                : "r"(sptr), "r"(prev_dptr)
+              );
+            }
+            __asm__ __volatile__ (
+              "vmovdqa64     (%0), %%zmm8 \n\t"
+              "vmovdqa64   64(%0), %%zmm9 \n\t"
+              "vmovdqa64  128(%0), %%zmm10\n\t"
+              "vmovdqa64  192(%0), %%zmm11\n\t"
+              :
+              : "r"(sptr), "r"(dptr)
+            );
+            // jerasure_total_memcpy_bytes += 512;
+          }
+          prev_dptr = dptr;
+        }
+        // write last result to memory
+        __asm__ __volatile__ (
+          "vmovdqa64  %%zmm8 ,    (%1)\n\t"
+          "vmovdqa64  %%zmm9 ,  64(%1)\n\t"
+          "vmovdqa64  %%zmm10, 128(%1)\n\t"
+          "vmovdqa64  %%zmm11, 192(%1)\n\t"
+          :
+          : "r"(sptr), "r"(prev_dptr)
+        );
+      }
+    } else if (packetsize <= 512) {
+      for (i = 0; i < packetsize; i += 512) {
+        prev_dptr = NULL;
+        for (op = 0; operations[op][0] >= 0; op++) {
+          sptr = ptrs[operations[op][0]] + operations[op][1]*packetsize + i;
+          dptr = ptrs[operations[op][2]] + operations[op][3]*packetsize + i;
+          if (operations[op][4]) {
+            // do xor operations here
+            __asm__ __volatile__ (
+              "vmovdqa64     (%0), %%zmm0\n\t"
+              "vmovdqa64   64(%0), %%zmm1\n\t"
+              "vmovdqa64  128(%0), %%zmm2\n\t"
+              "vmovdqa64  192(%0), %%zmm3\n\t"
+              "vmovdqa64  256(%0), %%zmm4\n\t"
+              "vmovdqa64  320(%0), %%zmm5\n\t"
+              "vmovdqa64  384(%0), %%zmm6\n\t"
+              "vmovdqa64  448(%0), %%zmm7\n\t"
+              "vpxord     %%zmm0 , %%zmm8 , %%zmm8 \n\t"
+              "vpxord     %%zmm1 , %%zmm9 , %%zmm9 \n\t"
+              "vpxord     %%zmm2 , %%zmm10, %%zmm10\n\t"
+              "vpxord     %%zmm3 , %%zmm11, %%zmm11\n\t"
+              "vpxord     %%zmm4 , %%zmm12, %%zmm12\n\t"
+              "vpxord     %%zmm5 , %%zmm13, %%zmm13\n\t"
+              "vpxord     %%zmm6 , %%zmm14, %%zmm14\n\t"
+              "vpxord     %%zmm7 , %%zmm15, %%zmm15\n\t"
+              :
+              : "r"(sptr), "r"(dptr)
+            );
+            // jerasure_total_xor_bytes += 512;
+          } else {
+            // write previous result to memory and copy current data to zmm registers
+            if (prev_dptr != NULL) {
+              __asm__ __volatile__ (
+                "vmovdqa64  %%zmm8 ,    (%1)\n\t"
+                "vmovdqa64  %%zmm9 ,  64(%1)\n\t"
+                "vmovdqa64  %%zmm10, 128(%1)\n\t"
+                "vmovdqa64  %%zmm11, 192(%1)\n\t"
+                "vmovdqa64  %%zmm12, 256(%1)\n\t"
+                "vmovdqa64  %%zmm13, 320(%1)\n\t"
+                "vmovdqa64  %%zmm14, 384(%1)\n\t"
+                "vmovdqa64  %%zmm15, 448(%1)\n\t"
+                :
+                : "r"(sptr), "r"(prev_dptr)
+              );
+            }
+            __asm__ __volatile__ (
+              "vmovdqa64     (%0), %%zmm8 \n\t"
+              "vmovdqa64   64(%0), %%zmm9 \n\t"
+              "vmovdqa64  128(%0), %%zmm10\n\t"
+              "vmovdqa64  192(%0), %%zmm11\n\t"
+              "vmovdqa64  256(%0), %%zmm12\n\t"
+              "vmovdqa64  320(%0), %%zmm13\n\t"
+              "vmovdqa64  384(%0), %%zmm14\n\t"
+              "vmovdqa64  448(%0), %%zmm15\n\t"
+              :
+              : "r"(sptr), "r"(dptr)
+            );
+            // jerasure_total_memcpy_bytes += 512;
+          }
+          prev_dptr = dptr;
+        }
+        // write last result to memory
+        __asm__ __volatile__ (
+          "vmovdqa64  %%zmm8 ,    (%1)\n\t"
+          "vmovdqa64  %%zmm9 ,  64(%1)\n\t"
+          "vmovdqa64  %%zmm10, 128(%1)\n\t"
+          "vmovdqa64  %%zmm11, 192(%1)\n\t"
+          "vmovdqa64  %%zmm12, 256(%1)\n\t"
+          "vmovdqa64  %%zmm13, 320(%1)\n\t"
+          "vmovdqa64  %%zmm14, 384(%1)\n\t"
+          "vmovdqa64  %%zmm15, 448(%1)\n\t"
+          :
+          : "r"(sptr), "r"(prev_dptr)
+        );
+      }
+    } else if (packetsize <= 1024) {
+      for (i = 0; i < packetsize; i += 1024) {
+        prev_dptr = NULL;
+        for (op = 0; operations[op][0] >= 0; op++) {
+          sptr = ptrs[operations[op][0]] + operations[op][1]*packetsize + i;
+          dptr = ptrs[operations[op][2]] + operations[op][3]*packetsize + i;
+          if (operations[op][4]) {
+            // do xor operations here
+            __asm__ __volatile__ (
+              "vmovdqa64     (%0), %%zmm0 \n\t"
+              "vmovdqa64   64(%0), %%zmm1 \n\t"
+              "vmovdqa64  128(%0), %%zmm2 \n\t"
+              "vmovdqa64  192(%0), %%zmm3 \n\t"
+              "vmovdqa64  256(%0), %%zmm4 \n\t"
+              "vmovdqa64  320(%0), %%zmm5 \n\t"
+              "vmovdqa64  384(%0), %%zmm6 \n\t"
+              "vmovdqa64  448(%0), %%zmm7 \n\t"
+              "vmovdqa64  512(%0), %%zmm8 \n\t"
+              "vmovdqa64  576(%0), %%zmm9 \n\t"
+              "vmovdqa64  640(%0), %%zmm10\n\t"
+              "vmovdqa64  704(%0), %%zmm11\n\t"
+              "vmovdqa64  768(%0), %%zmm12\n\t"
+              "vmovdqa64  832(%0), %%zmm13\n\t"
+              "vmovdqa64  896(%0), %%zmm14\n\t"
+              "vmovdqa64  960(%0), %%zmm15\n\t"
+              "vpxord     %%zmm0 , %%zmm16, %%zmm16\n\t"
+              "vpxord     %%zmm1 , %%zmm17, %%zmm17\n\t"
+              "vpxord     %%zmm2 , %%zmm18, %%zmm18\n\t"
+              "vpxord     %%zmm3 , %%zmm19, %%zmm19\n\t"
+              "vpxord     %%zmm4 , %%zmm20, %%zmm20\n\t"
+              "vpxord     %%zmm5 , %%zmm21, %%zmm21\n\t"
+              "vpxord     %%zmm6 , %%zmm22, %%zmm22\n\t"
+              "vpxord     %%zmm7 , %%zmm23, %%zmm23\n\t"
+              "vpxord     %%zmm8 , %%zmm24, %%zmm24\n\t"
+              "vpxord     %%zmm9 , %%zmm25, %%zmm25\n\t"
+              "vpxord     %%zmm10, %%zmm26, %%zmm26\n\t"
+              "vpxord     %%zmm11, %%zmm27, %%zmm27\n\t"
+              "vpxord     %%zmm12, %%zmm28, %%zmm28\n\t"
+              "vpxord     %%zmm13, %%zmm29, %%zmm29\n\t"
+              "vpxord     %%zmm14, %%zmm30, %%zmm30\n\t"
+              "vpxord     %%zmm15, %%zmm31, %%zmm31\n\t"
+              :
+              : "r"(sptr), "r"(dptr)
+            );
+            // jerasure_total_xor_bytes += 1024;
+          } else {
+            // write previous result to memory and copy current data to zmm registers
+            if (prev_dptr != NULL) {
+              __asm__ __volatile__ (
+                "vmovdqa64  %%zmm16,    (%1)\n\t"
+                "vmovdqa64  %%zmm17,  64(%1)\n\t"
+                "vmovdqa64  %%zmm18, 128(%1)\n\t"
+                "vmovdqa64  %%zmm19, 192(%1)\n\t"
+                "vmovdqa64  %%zmm20, 256(%1)\n\t"
+                "vmovdqa64  %%zmm21, 320(%1)\n\t"
+                "vmovdqa64  %%zmm22, 384(%1)\n\t"
+                "vmovdqa64  %%zmm23, 448(%1)\n\t"
+                "vmovdqa64  %%zmm24, 512(%1)\n\t"
+                "vmovdqa64  %%zmm25, 576(%1)\n\t"
+                "vmovdqa64  %%zmm26, 640(%1)\n\t"
+                "vmovdqa64  %%zmm27, 704(%1)\n\t"
+                "vmovdqa64  %%zmm28, 768(%1)\n\t"
+                "vmovdqa64  %%zmm29, 832(%1)\n\t"
+                "vmovdqa64  %%zmm30, 896(%1)\n\t"
+                "vmovdqa64  %%zmm31, 960(%1)\n\t"
+                :
+                : "r"(sptr), "r"(prev_dptr)
+              );
+            }
+            __asm__ __volatile__ (
+              "vmovdqa64     (%0), %%zmm16\n\t"
+              "vmovdqa64   64(%0), %%zmm17\n\t"
+              "vmovdqa64  128(%0), %%zmm18\n\t"
+              "vmovdqa64  192(%0), %%zmm19\n\t"
+              "vmovdqa64  256(%0), %%zmm20\n\t"
+              "vmovdqa64  320(%0), %%zmm21\n\t"
+              "vmovdqa64  384(%0), %%zmm22\n\t"
+              "vmovdqa64  448(%0), %%zmm23\n\t"
+              "vmovdqa64  512(%0), %%zmm24\n\t"
+              "vmovdqa64  576(%0), %%zmm25\n\t"
+              "vmovdqa64  640(%0), %%zmm26\n\t"
+              "vmovdqa64  704(%0), %%zmm27\n\t"
+              "vmovdqa64  768(%0), %%zmm28\n\t"
+              "vmovdqa64  832(%0), %%zmm29\n\t"
+              "vmovdqa64  896(%0), %%zmm30\n\t"
+              "vmovdqa64  960(%0), %%zmm31\n\t"
+              :
+              : "r"(sptr), "r"(dptr)
+            );
+            // jerasure_total_memcpy_bytes += 1024;
+          }
+          prev_dptr = dptr;
+        }
+        // write last result to memory
+        __asm__ __volatile__ (
+          "vmovdqa64  %%zmm16,    (%1)\n\t"
+          "vmovdqa64  %%zmm17,  64(%1)\n\t"
+          "vmovdqa64  %%zmm18, 128(%1)\n\t"
+          "vmovdqa64  %%zmm19, 192(%1)\n\t"
+          "vmovdqa64  %%zmm20, 256(%1)\n\t"
+          "vmovdqa64  %%zmm21, 320(%1)\n\t"
+          "vmovdqa64  %%zmm22, 384(%1)\n\t"
+          "vmovdqa64  %%zmm23, 448(%1)\n\t"
+          "vmovdqa64  %%zmm24, 512(%1)\n\t"
+          "vmovdqa64  %%zmm25, 576(%1)\n\t"
+          "vmovdqa64  %%zmm26, 640(%1)\n\t"
+          "vmovdqa64  %%zmm27, 704(%1)\n\t"
+          "vmovdqa64  %%zmm28, 768(%1)\n\t"
+          "vmovdqa64  %%zmm29, 832(%1)\n\t"
+          "vmovdqa64  %%zmm30, 896(%1)\n\t"
+          "vmovdqa64  %%zmm31, 960(%1)\n\t"
+          :
+          : "r"(sptr), "r"(prev_dptr)
+        );
+      }
+    } else {
+      for (i = 0; i < packetsize; i += 2048) {
+        prev_dptr = NULL;
+        for (op = 0; operations[op][0] >= 0; op++) {
+          sptr = ptrs[operations[op][0]] + operations[op][1]*packetsize + i;
+          dptr = ptrs[operations[op][2]] + operations[op][3]*packetsize + i;
+          if (operations[op][4]) {
+            // do xor operations here
+            __asm__ __volatile__ (
+              "vpxord        (%0), %%zmm0 , %%zmm0 \n\t"
+              "vpxord      64(%0), %%zmm1 , %%zmm1 \n\t"
+              "vpxord     128(%0), %%zmm2 , %%zmm2 \n\t"
+              "vpxord     192(%0), %%zmm3 , %%zmm3 \n\t"
+              "vpxord     256(%0), %%zmm4 , %%zmm4 \n\t"
+              "vpxord     320(%0), %%zmm5 , %%zmm5 \n\t"
+              "vpxord     384(%0), %%zmm6 , %%zmm6 \n\t"
+              "vpxord     448(%0), %%zmm7 , %%zmm7 \n\t"
+              "vpxord     512(%0), %%zmm8 , %%zmm8 \n\t"
+              "vpxord     576(%0), %%zmm9 , %%zmm9 \n\t"
+              "vpxord     640(%0), %%zmm10, %%zmm10\n\t"
+              "vpxord     704(%0), %%zmm11, %%zmm11\n\t"
+              "vpxord     768(%0), %%zmm12, %%zmm12\n\t"
+              "vpxord     832(%0), %%zmm13, %%zmm13\n\t"
+              "vpxord     896(%0), %%zmm14, %%zmm14\n\t"
+              "vpxord     960(%0), %%zmm15, %%zmm15\n\t"
+              "vpxord    1024(%0), %%zmm16, %%zmm16\n\t"
+              "vpxord    1088(%0), %%zmm17, %%zmm17\n\t"
+              "vpxord    1152(%0), %%zmm18, %%zmm18\n\t"
+              "vpxord    1216(%0), %%zmm19, %%zmm19\n\t"
+              "vpxord    1280(%0), %%zmm20, %%zmm20\n\t"
+              "vpxord    1344(%0), %%zmm21, %%zmm21\n\t"
+              "vpxord    1408(%0), %%zmm22, %%zmm22\n\t"
+              "vpxord    1472(%0), %%zmm23, %%zmm23\n\t"
+              "vpxord    1536(%0), %%zmm24, %%zmm24\n\t"
+              "vpxord    1600(%0), %%zmm25, %%zmm25\n\t"
+              "vpxord    1664(%0), %%zmm26, %%zmm26\n\t"
+              "vpxord    1728(%0), %%zmm27, %%zmm27\n\t"
+              "vpxord    1792(%0), %%zmm28, %%zmm28\n\t"
+              "vpxord    1856(%0), %%zmm29, %%zmm29\n\t"
+              "vpxord    1920(%0), %%zmm30, %%zmm30\n\t"
+              "vpxord    1984(%0), %%zmm31, %%zmm31\n\t"
+              :
+              : "r"(sptr), "r"(dptr)
+            );
+            // jerasure_total_xor_bytes += 2048;
+          } else {
+            // write previous result to memory and copy current data to zmm registers
+            if (prev_dptr != NULL) {
+              __asm__ __volatile__ (
+                "vmovdqa64  %%zmm0 ,     (%1)\n\t"
+                "vmovdqa64  %%zmm1 ,   64(%1)\n\t"
+                "vmovdqa64  %%zmm2 ,  128(%1)\n\t"
+                "vmovdqa64  %%zmm3 ,  192(%1)\n\t"
+                "vmovdqa64  %%zmm4 ,  256(%1)\n\t"
+                "vmovdqa64  %%zmm5 ,  320(%1)\n\t"
+                "vmovdqa64  %%zmm6 ,  384(%1)\n\t"
+                "vmovdqa64  %%zmm7 ,  448(%1)\n\t"
+                "vmovdqa64  %%zmm8 ,  512(%1)\n\t"
+                "vmovdqa64  %%zmm9 ,  576(%1)\n\t"
+                "vmovdqa64  %%zmm10,  640(%1)\n\t"
+                "vmovdqa64  %%zmm11,  704(%1)\n\t"
+                "vmovdqa64  %%zmm12,  768(%1)\n\t"
+                "vmovdqa64  %%zmm13,  832(%1)\n\t"
+                "vmovdqa64  %%zmm14,  896(%1)\n\t"
+                "vmovdqa64  %%zmm15,  960(%1)\n\t"
+                "vmovdqa64  %%zmm16, 1024(%1)\n\t"
+                "vmovdqa64  %%zmm17, 1088(%1)\n\t"
+                "vmovdqa64  %%zmm18, 1152(%1)\n\t"
+                "vmovdqa64  %%zmm19, 1216(%1)\n\t"
+                "vmovdqa64  %%zmm20, 1280(%1)\n\t"
+                "vmovdqa64  %%zmm21, 1344(%1)\n\t"
+                "vmovdqa64  %%zmm22, 1408(%1)\n\t"
+                "vmovdqa64  %%zmm23, 1472(%1)\n\t"
+                "vmovdqa64  %%zmm24, 1536(%1)\n\t"
+                "vmovdqa64  %%zmm25, 1600(%1)\n\t"
+                "vmovdqa64  %%zmm26, 1664(%1)\n\t"
+                "vmovdqa64  %%zmm27, 1728(%1)\n\t"
+                "vmovdqa64  %%zmm28, 1792(%1)\n\t"
+                "vmovdqa64  %%zmm29, 1856(%1)\n\t"
+                "vmovdqa64  %%zmm30, 1920(%1)\n\t"
+                "vmovdqa64  %%zmm31, 1984(%1)\n\t"
+                :
+                : "r"(sptr), "r"(prev_dptr)
+              );
+            }
+            __asm__ __volatile__ (
+              "vmovdqa64      (%0), %%zmm0 \n\t"
+              "vmovdqa64    64(%0), %%zmm1 \n\t"
+              "vmovdqa64   128(%0), %%zmm2 \n\t"
+              "vmovdqa64   192(%0), %%zmm3 \n\t"
+              "vmovdqa64   256(%0), %%zmm4 \n\t"
+              "vmovdqa64   320(%0), %%zmm5 \n\t"
+              "vmovdqa64   384(%0), %%zmm6 \n\t"
+              "vmovdqa64   448(%0), %%zmm7 \n\t"
+              "vmovdqa64   512(%0), %%zmm8 \n\t"
+              "vmovdqa64   576(%0), %%zmm9 \n\t"
+              "vmovdqa64   640(%0), %%zmm10\n\t"
+              "vmovdqa64   704(%0), %%zmm11\n\t"
+              "vmovdqa64   768(%0), %%zmm12\n\t"
+              "vmovdqa64   832(%0), %%zmm13\n\t"
+              "vmovdqa64   896(%0), %%zmm14\n\t"
+              "vmovdqa64   960(%0), %%zmm15\n\t"
+              "vmovdqa64  1024(%0), %%zmm16\n\t"
+              "vmovdqa64  1088(%0), %%zmm17\n\t"
+              "vmovdqa64  1152(%0), %%zmm18\n\t"
+              "vmovdqa64  1216(%0), %%zmm19\n\t"
+              "vmovdqa64  1280(%0), %%zmm20\n\t"
+              "vmovdqa64  1344(%0), %%zmm21\n\t"
+              "vmovdqa64  1408(%0), %%zmm22\n\t"
+              "vmovdqa64  1472(%0), %%zmm23\n\t"
+              "vmovdqa64  1536(%0), %%zmm24\n\t"
+              "vmovdqa64  1600(%0), %%zmm25\n\t"
+              "vmovdqa64  1664(%0), %%zmm26\n\t"
+              "vmovdqa64  1728(%0), %%zmm27\n\t"
+              "vmovdqa64  1792(%0), %%zmm28\n\t"
+              "vmovdqa64  1856(%0), %%zmm29\n\t"
+              "vmovdqa64  1920(%0), %%zmm30\n\t"
+              "vmovdqa64  1984(%0), %%zmm31\n\t"
+              :
+              : "r"(sptr), "r"(dptr)
+            );
+            // jerasure_total_memcpy_bytes += 2048;
+          }
+          prev_dptr = dptr;
+        }
+        // write last result to memory
+        __asm__ __volatile__ (
+          "vmovdqa64  %%zmm0 ,     (%1)\n\t"
+          "vmovdqa64  %%zmm1 ,   64(%1)\n\t"
+          "vmovdqa64  %%zmm2 ,  128(%1)\n\t"
+          "vmovdqa64  %%zmm3 ,  192(%1)\n\t"
+          "vmovdqa64  %%zmm4 ,  256(%1)\n\t"
+          "vmovdqa64  %%zmm5 ,  320(%1)\n\t"
+          "vmovdqa64  %%zmm6 ,  384(%1)\n\t"
+          "vmovdqa64  %%zmm7 ,  448(%1)\n\t"
+          "vmovdqa64  %%zmm8 ,  512(%1)\n\t"
+          "vmovdqa64  %%zmm9 ,  576(%1)\n\t"
+          "vmovdqa64  %%zmm10,  640(%1)\n\t"
+          "vmovdqa64  %%zmm11,  704(%1)\n\t"
+          "vmovdqa64  %%zmm12,  768(%1)\n\t"
+          "vmovdqa64  %%zmm13,  832(%1)\n\t"
+          "vmovdqa64  %%zmm14,  896(%1)\n\t"
+          "vmovdqa64  %%zmm15,  960(%1)\n\t"
+          "vmovdqa64  %%zmm16, 1024(%1)\n\t"
+          "vmovdqa64  %%zmm17, 1088(%1)\n\t"
+          "vmovdqa64  %%zmm18, 1152(%1)\n\t"
+          "vmovdqa64  %%zmm19, 1216(%1)\n\t"
+          "vmovdqa64  %%zmm20, 1280(%1)\n\t"
+          "vmovdqa64  %%zmm21, 1344(%1)\n\t"
+          "vmovdqa64  %%zmm22, 1408(%1)\n\t"
+          "vmovdqa64  %%zmm23, 1472(%1)\n\t"
+          "vmovdqa64  %%zmm24, 1536(%1)\n\t"
+          "vmovdqa64  %%zmm25, 1600(%1)\n\t"
+          "vmovdqa64  %%zmm26, 1664(%1)\n\t"
+          "vmovdqa64  %%zmm27, 1728(%1)\n\t"
+          "vmovdqa64  %%zmm28, 1792(%1)\n\t"
+          "vmovdqa64  %%zmm29, 1856(%1)\n\t"
+          "vmovdqa64  %%zmm30, 1920(%1)\n\t"
+          "vmovdqa64  %%zmm31, 1984(%1)\n\t"
+          :
+          : "r"(sptr), "r"(prev_dptr)
+        );
+      }
+    }
+#elif defined(__AVX__)
+    if (packetsize == 64) {
+      for (i = 0; i < packetsize; i += 64)
+      {
+        prev_dptr = NULL;
+        for (op = 0; operations[op][0] >= 0; op++) {
+          sptr = ptrs[operations[op][0]] + operations[op][1]*packetsize + i;
+          dptr = ptrs[operations[op][2]] + operations[op][3]*packetsize + i;
+          if (operations[op][4]) {
+            // do xor operations here
+            __asm__ __volatile__ (
+              "vpxor     (%0), %%ymm0 , %%ymm0 \n\t"
+              "vpxor   32(%0), %%ymm1 , %%ymm1 \n\t"
+              :
+              : "r"(sptr), "r"(dptr)
+            );
+            // don't know why, but in gcc O2 optimization level, the assembly code
+            // of this line use xmm register, destroy the data in ymm register
+            // assembly code: vaddsd %xmm0,%xmm1,%xmm1
+            // jerasure_total_xor_bytes += 512;
+          } else {
+            // write previous result to memory and copy current data to ymm registers
+            if (prev_dptr != NULL) {
+              __asm__ __volatile__ (
+                "vmovdqa  %%ymm0 ,    (%1)\n\t"
+                "vmovdqa  %%ymm1 ,  32(%1)\n\t"
+                :
+                : "r"(sptr), "r"(prev_dptr)
+              );
+            }
+            __asm__ __volatile__ (
+              "vmovdqa     (%0), %%ymm0 \n\t"
+              "vmovdqa   32(%0), %%ymm1 \n\t"
+              :
+              : "r"(sptr), "r"(dptr)
+            );
+            // jerasure_total_memcpy_bytes += 512;
+          }
+          prev_dptr = dptr;
+        }
+        // write last result to memory
+        __asm__ __volatile__ (
+          "vmovdqa  %%ymm0 ,    (%1)\n\t"
+          "vmovdqa  %%ymm1 ,  32(%1)\n\t"
+          :
+          : "r"(sptr), "r"(prev_dptr)
+        );
+        // jerasure_total_memcpy_bytes += 512;
+      }
+    } else if (packetsize <= 128) {
+      for (i = 0; i < packetsize; i += 128)
+      {
+        prev_dptr = NULL;
+        for (op = 0; operations[op][0] >= 0; op++) {
+          sptr = ptrs[operations[op][0]] + operations[op][1]*packetsize + i;
+          dptr = ptrs[operations[op][2]] + operations[op][3]*packetsize + i;
+          if (operations[op][4]) {
+            // do xor operations here
+            __asm__ __volatile__ (
+              "vpxor     (%0), %%ymm0 , %%ymm0 \n\t"
+              "vpxor   32(%0), %%ymm1 , %%ymm1 \n\t"
+              "vpxor   64(%0), %%ymm2 , %%ymm2 \n\t"
+              "vpxor   96(%0), %%ymm3 , %%ymm3 \n\t"
+              :
+              : "r"(sptr), "r"(dptr)
+            );
+            // don't know why, but in gcc O2 optimization level, the assembly code
+            // of this line use xmm register, destroy the data in ymm register
+            // assembly code: vaddsd %xmm0,%xmm1,%xmm1
+            // jerasure_total_xor_bytes += 512;
+          } else {
+            // write previous result to memory and copy current data to ymm registers
+            if (prev_dptr != NULL) {
+              __asm__ __volatile__ (
+                "vmovdqa  %%ymm0 ,    (%1)\n\t"
+                "vmovdqa  %%ymm1 ,  32(%1)\n\t"
+                "vmovdqa  %%ymm2 ,  64(%1)\n\t"
+                "vmovdqa  %%ymm3 ,  96(%1)\n\t"
+                :
+                : "r"(sptr), "r"(prev_dptr)
+              );
+            }
+            __asm__ __volatile__ (
+              "vmovdqa     (%0), %%ymm0 \n\t"
+              "vmovdqa   32(%0), %%ymm1 \n\t"
+              "vmovdqa   64(%0), %%ymm2 \n\t"
+              "vmovdqa   96(%0), %%ymm3 \n\t"
+              :
+              : "r"(sptr), "r"(dptr)
+            );
+            // jerasure_total_memcpy_bytes += 512;
+          }
+          prev_dptr = dptr;
+        }
+        // write last result to memory
+        __asm__ __volatile__ (
+          "vmovdqa  %%ymm0 ,    (%1)\n\t"
+          "vmovdqa  %%ymm1 ,  32(%1)\n\t"
+          "vmovdqa  %%ymm2 ,  64(%1)\n\t"
+          "vmovdqa  %%ymm3 ,  96(%1)\n\t"
+          :
+          : "r"(sptr), "r"(prev_dptr)
+        );
+        // jerasure_total_memcpy_bytes += 512;
+      }
+    } else if (packetsize <= 256) {
+      for (i = 0; i < packetsize; i += 256)
+      {
+        prev_dptr = NULL;
+        for (op = 0; operations[op][0] >= 0; op++) {
+          sptr = ptrs[operations[op][0]] + operations[op][1]*packetsize + i;
+          dptr = ptrs[operations[op][2]] + operations[op][3]*packetsize + i;
+          if (operations[op][4]) {
+            // do xor operations here
+            __asm__ __volatile__ (
+              "vpxor     (%0), %%ymm0 , %%ymm0 \n\t"
+              "vpxor   32(%0), %%ymm1 , %%ymm1 \n\t"
+              "vpxor   64(%0), %%ymm2 , %%ymm2 \n\t"
+              "vpxor   96(%0), %%ymm3 , %%ymm3 \n\t"
+              "vpxor  128(%0), %%ymm4 , %%ymm4 \n\t"
+              "vpxor  160(%0), %%ymm5 , %%ymm5 \n\t"
+              "vpxor  192(%0), %%ymm6 , %%ymm6 \n\t"
+              "vpxor  224(%0), %%ymm7 , %%ymm7 \n\t"
+              :
+              : "r"(sptr), "r"(dptr)
+            );
+            // don't know why, but in gcc O2 optimization level, the assembly code
+            // of this line use xmm register, destroy the data in ymm register
+            // assembly code: vaddsd %xmm0,%xmm1,%xmm1
+            // jerasure_total_xor_bytes += 512;
+          } else {
+            // write previous result to memory and copy current data to ymm registers
+            if (prev_dptr != NULL) {
+              __asm__ __volatile__ (
+                "vmovdqa  %%ymm0 ,    (%1)\n\t"
+                "vmovdqa  %%ymm1 ,  32(%1)\n\t"
+                "vmovdqa  %%ymm2 ,  64(%1)\n\t"
+                "vmovdqa  %%ymm3 ,  96(%1)\n\t"
+                "vmovdqa  %%ymm4 , 128(%1)\n\t"
+                "vmovdqa  %%ymm5 , 160(%1)\n\t"
+                "vmovdqa  %%ymm6 , 192(%1)\n\t"
+                "vmovdqa  %%ymm7 , 224(%1)\n\t"
+                :
+                : "r"(sptr), "r"(prev_dptr)
+              );
+            }
+            __asm__ __volatile__ (
+              "vmovdqa     (%0), %%ymm0 \n\t"
+              "vmovdqa   32(%0), %%ymm1 \n\t"
+              "vmovdqa   64(%0), %%ymm2 \n\t"
+              "vmovdqa   96(%0), %%ymm3 \n\t"
+              "vmovdqa  128(%0), %%ymm4 \n\t"
+              "vmovdqa  160(%0), %%ymm5 \n\t"
+              "vmovdqa  192(%0), %%ymm6 \n\t"
+              "vmovdqa  224(%0), %%ymm7 \n\t"
+              :
+              : "r"(sptr), "r"(dptr)
+            );
+            // jerasure_total_memcpy_bytes += 512;
+          }
+          prev_dptr = dptr;
+        }
+        // write last result to memory
+        __asm__ __volatile__ (
+          "vmovdqa  %%ymm0 ,    (%1)\n\t"
+          "vmovdqa  %%ymm1 ,  32(%1)\n\t"
+          "vmovdqa  %%ymm2 ,  64(%1)\n\t"
+          "vmovdqa  %%ymm3 ,  96(%1)\n\t"
+          "vmovdqa  %%ymm4 , 128(%1)\n\t"
+          "vmovdqa  %%ymm5 , 160(%1)\n\t"
+          "vmovdqa  %%ymm6 , 192(%1)\n\t"
+          "vmovdqa  %%ymm7 , 224(%1)\n\t"
+          :
+          : "r"(sptr), "r"(prev_dptr)
+        );
+        // jerasure_total_memcpy_bytes += 512;
+      }
+    } else {
+      for (i = 0; i < packetsize; i += 512)
+      {
+        prev_dptr = NULL;
+        for (op = 0; operations[op][0] >= 0; op++) {
+          sptr = ptrs[operations[op][0]] + operations[op][1]*packetsize + i;
+          dptr = ptrs[operations[op][2]] + operations[op][3]*packetsize + i;
+          if (operations[op][4]) {
+            // do xor operations here
+            __asm__ __volatile__ (
+              "vpxor     (%0), %%ymm0 , %%ymm0 \n\t"
+              "vpxor   32(%0), %%ymm1 , %%ymm1 \n\t"
+              "vpxor   64(%0), %%ymm2 , %%ymm2 \n\t"
+              "vpxor   96(%0), %%ymm3 , %%ymm3 \n\t"
+              "vpxor  128(%0), %%ymm4 , %%ymm4 \n\t"
+              "vpxor  160(%0), %%ymm5 , %%ymm5 \n\t"
+              "vpxor  192(%0), %%ymm6 , %%ymm6 \n\t"
+              "vpxor  224(%0), %%ymm7 , %%ymm7 \n\t"
+              "vpxor  256(%0), %%ymm8 , %%ymm8 \n\t"
+              "vpxor  288(%0), %%ymm9 , %%ymm9 \n\t"
+              "vpxor  320(%0), %%ymm10, %%ymm10\n\t"
+              "vpxor  352(%0), %%ymm11, %%ymm11\n\t"
+              "vpxor  384(%0), %%ymm12, %%ymm12\n\t"
+              "vpxor  416(%0), %%ymm13, %%ymm13\n\t"
+              "vpxor  448(%0), %%ymm14, %%ymm14\n\t"
+              "vpxor  480(%0), %%ymm15, %%ymm15\n\t"
+              :
+              : "r"(sptr), "r"(dptr)
+            );
+            // don't know why, but in gcc O2 optimization level, the assembly code
+            // of this line use xmm register, destroy the data in ymm register
+            // assembly code: vaddsd %xmm0,%xmm1,%xmm1
+            // jerasure_total_xor_bytes += 512;
+          } else {
+            // write previous result to memory and copy current data to ymm registers
+            if (prev_dptr != NULL) {
+              __asm__ __volatile__ (
+                "vmovdqa  %%ymm0 ,    (%1)\n\t"
+                "vmovdqa  %%ymm1 ,  32(%1)\n\t"
+                "vmovdqa  %%ymm2 ,  64(%1)\n\t"
+                "vmovdqa  %%ymm3 ,  96(%1)\n\t"
+                "vmovdqa  %%ymm4 , 128(%1)\n\t"
+                "vmovdqa  %%ymm5 , 160(%1)\n\t"
+                "vmovdqa  %%ymm6 , 192(%1)\n\t"
+                "vmovdqa  %%ymm7 , 224(%1)\n\t"
+                "vmovdqa  %%ymm8 , 256(%1)\n\t"
+                "vmovdqa  %%ymm9 , 288(%1)\n\t"
+                "vmovdqa  %%ymm10, 320(%1)\n\t"
+                "vmovdqa  %%ymm11, 352(%1)\n\t"
+                "vmovdqa  %%ymm12, 384(%1)\n\t"
+                "vmovdqa  %%ymm13, 416(%1)\n\t"
+                "vmovdqa  %%ymm14, 448(%1)\n\t"
+                "vmovdqa  %%ymm15, 480(%1)\n\t"
+                :
+                : "r"(sptr), "r"(prev_dptr)
+              );
+            }
+            __asm__ __volatile__ (
+              "vmovdqa     (%0), %%ymm0 \n\t"
+              "vmovdqa   32(%0), %%ymm1 \n\t"
+              "vmovdqa   64(%0), %%ymm2 \n\t"
+              "vmovdqa   96(%0), %%ymm3 \n\t"
+              "vmovdqa  128(%0), %%ymm4 \n\t"
+              "vmovdqa  160(%0), %%ymm5 \n\t"
+              "vmovdqa  192(%0), %%ymm6 \n\t"
+              "vmovdqa  224(%0), %%ymm7 \n\t"
+              "vmovdqa  256(%0), %%ymm8 \n\t"
+              "vmovdqa  288(%0), %%ymm9 \n\t"
+              "vmovdqa  320(%0), %%ymm10\n\t"
+              "vmovdqa  352(%0), %%ymm11\n\t"
+              "vmovdqa  384(%0), %%ymm12\n\t"
+              "vmovdqa  416(%0), %%ymm13\n\t"
+              "vmovdqa  448(%0), %%ymm14\n\t"
+              "vmovdqa  480(%0), %%ymm15\n\t"
+              :
+              : "r"(sptr), "r"(dptr)
+            );
+            // jerasure_total_memcpy_bytes += 512;
+          }
+          prev_dptr = dptr;
+        }
+        // write last result to memory
+        __asm__ __volatile__ (
+          "vmovdqa  %%ymm0 ,    (%1)\n\t"
+          "vmovdqa  %%ymm1 ,  32(%1)\n\t"
+          "vmovdqa  %%ymm2 ,  64(%1)\n\t"
+          "vmovdqa  %%ymm3 ,  96(%1)\n\t"
+          "vmovdqa  %%ymm4 , 128(%1)\n\t"
+          "vmovdqa  %%ymm5 , 160(%1)\n\t"
+          "vmovdqa  %%ymm6 , 192(%1)\n\t"
+          "vmovdqa  %%ymm7 , 224(%1)\n\t"
+          "vmovdqa  %%ymm8 , 256(%1)\n\t"
+          "vmovdqa  %%ymm9 , 288(%1)\n\t"
+          "vmovdqa  %%ymm10, 320(%1)\n\t"
+          "vmovdqa  %%ymm11, 352(%1)\n\t"
+          "vmovdqa  %%ymm12, 384(%1)\n\t"
+          "vmovdqa  %%ymm13, 416(%1)\n\t"
+          "vmovdqa  %%ymm14, 448(%1)\n\t"
+          "vmovdqa  %%ymm15, 480(%1)\n\t"
+          :
+          : "r"(sptr), "r"(prev_dptr)
+        );
+        // jerasure_total_memcpy_bytes += 512;
+      }
+    }
+#elif defined(__SSE__)
+    if (packetsize == 64) {
+      for (i = 0; i < packetsize; i += 64)
+      {
+        prev_dptr = NULL;
+        for (op = 0; operations[op][0] >= 0; op++) {
+          sptr = ptrs[operations[op][0]] + operations[op][1]*packetsize + i;
+          dptr = ptrs[operations[op][2]] + operations[op][3]*packetsize + i;
+          if (operations[op][4]) {
+            // do xor operations here
+            __asm__ __volatile__ (
+              "pxor     (%0), %%xmm0\n\t"
+              "pxor   16(%0), %%xmm1\n\t"
+              "pxor   32(%0), %%xmm2\n\t"
+              "pxor   48(%0), %%xmm3\n\t"
+              :
+              : "r"(sptr), "r"(dptr)
+            );
+            // jerasure_total_xor_bytes += 128;
+          } else {
+            // write previous result to memory and copy current data to last 4 xmm registers
+            if (prev_dptr != NULL) {
+              __asm__ __volatile__ (
+                "movdqa  %%xmm0,    (%1)\n\t"
+                "movdqa  %%xmm1,  16(%1)\n\t"
+                "movdqa  %%xmm2,  32(%1)\n\t"
+                "movdqa  %%xmm3,  48(%1)\n\t"
+                :
+                : "r"(sptr), "r"(prev_dptr)
+              );
+            }
+            __asm__ __volatile__ (
+              "movdqa     (%0), %%xmm0\n\t"
+              "movdqa   16(%0), %%xmm1\n\t"
+              "movdqa   32(%0), %%xmm2\n\t"
+              "movdqa   48(%0), %%xmm3\n\t"
+              :
+              : "r"(sptr), "r"(dptr)
+            );
+            // jerasure_total_memcpy_bytes += 128;
+          }
+          prev_dptr = dptr;
+        }
+        // write last result to memory
+        __asm__ __volatile__ (
+          "movdqa  %%xmm0,    (%1)\n\t"
+          "movdqa  %%xmm1,  16(%1)\n\t"
+          "movdqa  %%xmm2,  32(%1)\n\t"
+          "movdqa  %%xmm3,  48(%1)\n\t"
+          :
+          : "r"(sptr), "r"(prev_dptr)
+        );
+      }
+    } else {
+      for (i = 0; i < packetsize; i += 128)
+      {
+        prev_dptr = NULL;
+        for (op = 0; operations[op][0] >= 0; op++) {
+          sptr = ptrs[operations[op][0]] + operations[op][1]*packetsize + i;
+          dptr = ptrs[operations[op][2]] + operations[op][3]*packetsize + i;
+          if (operations[op][4]) {
+            // do xor operations here
+            __asm__ __volatile__ (
+              "pxor     (%0), %%xmm0\n\t"
+              "pxor   16(%0), %%xmm1\n\t"
+              "pxor   32(%0), %%xmm2\n\t"
+              "pxor   48(%0), %%xmm3\n\t"
+              "pxor   64(%0), %%xmm4\n\t"
+              "pxor   80(%0), %%xmm5\n\t"
+              "pxor   96(%0), %%xmm6\n\t"
+              "pxor  112(%0), %%xmm7\n\t"
+              :
+              : "r"(sptr), "r"(dptr)
+            );
+            // jerasure_total_xor_bytes += 128;
+          } else {
+            // write previous result to memory and copy current data to last 4 xmm registers
+            if (prev_dptr != NULL) {
+              __asm__ __volatile__ (
+                "movdqa  %%xmm0,    (%1)\n\t"
+                "movdqa  %%xmm1,  16(%1)\n\t"
+                "movdqa  %%xmm2,  32(%1)\n\t"
+                "movdqa  %%xmm3,  48(%1)\n\t"
+                "movdqa  %%xmm4,  64(%1)\n\t"
+                "movdqa  %%xmm5,  80(%1)\n\t"
+                "movdqa  %%xmm6,  96(%1)\n\t"
+                "movdqa  %%xmm7, 112(%1)\n\t"
+                :
+                : "r"(sptr), "r"(prev_dptr)
+              );
+            }
+            __asm__ __volatile__ (
+              "movdqa     (%0), %%xmm0\n\t"
+              "movdqa   16(%0), %%xmm1\n\t"
+              "movdqa   32(%0), %%xmm2\n\t"
+              "movdqa   48(%0), %%xmm3\n\t"
+              "movdqa   64(%0), %%xmm4\n\t"
+              "movdqa   80(%0), %%xmm5\n\t"
+              "movdqa   96(%0), %%xmm6\n\t"
+              "movdqa  112(%0), %%xmm7\n\t"
+              :
+              : "r"(sptr), "r"(dptr)
+            );
+            // jerasure_total_memcpy_bytes += 128;
+          }
+          prev_dptr = dptr;
+        }
+        // write last result to memory
+        __asm__ __volatile__ (
+          "movdqa  %%xmm0,    (%1)\n\t"
+          "movdqa  %%xmm1,  16(%1)\n\t"
+          "movdqa  %%xmm2,  32(%1)\n\t"
+          "movdqa  %%xmm3,  48(%1)\n\t"
+          "movdqa  %%xmm4,  64(%1)\n\t"
+          "movdqa  %%xmm5,  80(%1)\n\t"
+          "movdqa  %%xmm6,  96(%1)\n\t"
+          "movdqa  %%xmm7, 112(%1)\n\t"
+          :
+          : "r"(sptr), "r"(prev_dptr)
+        );
+      }
+    }
+#else
+    for (op = 0; operations[op][0] >= 0; op++) {
+      sptr = ptrs[operations[op][0]] + operations[op][1]*packetsize;
+      dptr = ptrs[operations[op][2]] + operations[op][3]*packetsize;
+      if (operations[op][4]) {
 /*      printf("%d,%d %d,%d\n", operations[op][0], 
       operations[op][1], 
       operations[op][2], 
       operations[op][3]); 
       printf("xor(0x%x, 0x%x -> 0x%x, %d)\n", sptr, dptr, dptr, packetsize); */
-      galois_region_xor(sptr, dptr, packetsize);
-      jerasure_total_xor_bytes += packetsize;
-    } else {
+        galois_region_xor(sptr, dptr, packetsize);
+        jerasure_total_xor_bytes += packetsize;
+      } else {
 /*      printf("memcpy(0x%x <- 0x%x)\n", dptr, sptr); */
-      memcpy(dptr, sptr, packetsize);
-      jerasure_total_memcpy_bytes += packetsize;
+        memcpy(dptr, sptr, packetsize);
+        jerasure_total_memcpy_bytes += packetsize;
+      }
     }
-  }  
+#endif
+  } else {
+    for (op = 0; operations[op][0] >= 0; op++) {
+      sptr = ptrs[operations[op][0]] + operations[op][1]*packetsize;
+      dptr = ptrs[operations[op][2]] + operations[op][3]*packetsize;
+      if (operations[op][4]) {
+/*      printf("%d,%d %d,%d\n", operations[op][0], 
+      operations[op][1], 
+      operations[op][2], 
+      operations[op][3]); 
+      printf("xor(0x%x, 0x%x -> 0x%x, %d)\n", sptr, dptr, dptr, packetsize); */
+        galois_region_xor(sptr, dptr, packetsize);
+        jerasure_total_xor_bytes += packetsize;
+      } else {
+/*      printf("memcpy(0x%x <- 0x%x)\n", dptr, sptr); */
+        memcpy(dptr, sptr, packetsize);
+        jerasure_total_memcpy_bytes += packetsize;
+      }
+    }
+  }
 }
 
 void jerasure_schedule_encode(int k, int m, int w, int **schedule,
                                    char **data_ptrs, char **coding_ptrs, int size, int packetsize)
 {
-  char **ptr_copy;
-  int i, tdone;
+  static bool first_call = true;
+  int i, j;
+  static char *** p_sub_ptr_copies;
+  static int cpu_num;
+  static int shift_num;
+  static int shifts[2];
+  static pthread_cond_t *p_empties, *p_fills;
+  static pthread_mutex_t *p_mutexes;
+  static struct thread_arg *p_thread_args;
+  static pthread_t *p_ps;
+  int rc;
+  // cpu_set_t mask;
 
-  ptr_copy = talloc(char *, (k+m));
-  for (i = 0; i < k; i++) ptr_copy[i] = data_ptrs[i];
-  for (i = 0; i < m; i++) ptr_copy[i+k] = coding_ptrs[i];
-  for (tdone = 0; tdone < size; tdone += packetsize*w) {
-    jerasure_do_scheduled_operations(ptr_copy, schedule, packetsize);
-    for (i = 0; i < k+m; i++) ptr_copy[i] += (packetsize*w);
+  if (first_call) {
+    cpu_num = (int) sysconf(_SC_NPROCESSORS_ONLN);
+    // cpu_num = 8;
+    // printf("use %d threads\n", cpu_num);
+    shifts[1] = size / (packetsize * w) / cpu_num;
+    shifts[0] = shifts[1] + 1;
+    shift_num = size / (packetsize * w) - cpu_num * shifts[1];
+
+    p_sub_ptr_copies = talloc(char **, cpu_num);
+    p_empties = talloc(pthread_cond_t, cpu_num);
+    p_fills = talloc(pthread_cond_t, cpu_num);
+    p_mutexes = talloc(pthread_mutex_t, cpu_num);
+    p_thread_args = talloc(struct thread_arg, cpu_num);
+    p_ps = talloc(pthread_t, cpu_num);
+    for (i = 0; i < cpu_num; i++) {
+      pthread_cond_init(&p_empties[i], NULL);
+      pthread_cond_init(&p_fills[i], NULL);
+      pthread_mutex_init(&p_mutexes[i], NULL);
+      p_thread_args[i].pempty = &p_empties[i];
+      p_thread_args[i].pfill = &p_fills[i];
+      p_thread_args[i].pmutex = &p_mutexes[i];
+      p_thread_args[i].ready = false;
+      rc = pthread_create(&p_ps[i], NULL, jerasure_do_scheduled_operations_thread, &p_thread_args[i]); assert(rc == 0);
+      // CPU_ZERO(&mask);
+      // CPU_SET(i, &mask);
+      // assert(!pthread_setaffinity_np(p[i], sizeof(cpu_set_t), &mask));
+    }
+
+    first_call = false;
   }
-  free(ptr_copy);
+
+  k_global = k;
+  m_global = m;
+  w_global = w;
+  packetsize_global = packetsize;
+  schedule_global = schedule;
+
+  for (i = 0; i < shift_num; i++) {
+    p_thread_args[i].size = shifts[0] * packetsize * w;
+    p_sub_ptr_copies[i] = talloc(char *, (k+m));
+    for (j = 0; j < k; j++) 
+      p_sub_ptr_copies[i][j] = data_ptrs[j] + i * shifts[0] * packetsize * w;
+    for (j = 0; j < m; j++) 
+      p_sub_ptr_copies[i][j+k] = coding_ptrs[j] + i * shifts[0] * packetsize * w;
+    p_thread_args[i].ptrs = p_sub_ptr_copies[i];
+  }
+  for (i = shift_num; i < cpu_num; i++) {
+    p_thread_args[i].size = shifts[1] * packetsize * w;
+    p_sub_ptr_copies[i] = talloc(char *, (k+m));
+    for (j = 0; j < k; j++) 
+      p_sub_ptr_copies[i][j] = data_ptrs[j] + (shift_num * shifts[0]+ (i - shift_num) * shifts[1]) * packetsize * w;
+    for (j = 0; j < m; j++) 
+      p_sub_ptr_copies[i][j+k] = coding_ptrs[j] + (shift_num * shifts[0]+ (i - shift_num) * shifts[1]) * packetsize * w;
+    p_thread_args[i].ptrs = p_sub_ptr_copies[i];
+  }
+
+  for (i = 0; i < cpu_num; i++) {
+    pthread_mutex_lock(&p_mutexes[i]);
+    p_thread_args[i].ready = true;
+    pthread_cond_signal(&p_fills[i]);
+    pthread_mutex_unlock(&p_mutexes[i]);
+  }
+  for (i = 0; i < cpu_num; i++) {
+    pthread_mutex_lock(&p_mutexes[i]);
+    while (p_thread_args[i].ready)
+      pthread_cond_wait(&p_empties[i], &p_mutexes[i]);
+    pthread_mutex_unlock(&p_mutexes[i]);
+  }
+
+  for (i = 0; i < cpu_num; i++)
+    free(p_sub_ptr_copies[i]);
 }
     
 int **jerasure_dumb_bitmatrix_to_schedule(int k, int m, int w, int *bitmatrix)

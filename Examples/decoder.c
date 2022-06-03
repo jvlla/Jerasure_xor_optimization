@@ -1,48 +1,51 @@
-/* *
- * Copyright (c) 2014, James S. Plank and Kevin Greenan
- * All rights reserved.
- *
- * Jerasure - A C/C++ Library for a Variety of Reed-Solomon and RAID-6 Erasure
- * Coding Techniques
- *
- * Revision 2.0: Galois Field backend now links to GF-Complete
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- *
- *  - Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- *
- *  - Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in
- *    the documentation and/or other materials provided with the
- *    distribution.
- *
- *  - Neither the name of the University of Tennessee nor the names of its
- *    contributors may be used to endorse or promote products derived
- *    from this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
- * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
- * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
- * HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
- * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
- * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
- * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
- * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY
- * WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
- */
+/* Examples/decoder.c
+ * Catherine D. Schuman, James S. Plank
 
-/* Jerasure's authors:
+Jerasure - A C/C++ Library for a Variety of Reed-Solomon and RAID-6 Erasure Coding Techniques
 
-   Revision 2.x - 2014: James S. Plank and Kevin M. Greenan.
-   Revision 1.2 - 2008: James S. Plank, Scott Simmerman and Catherine D. Schuman.
-   Revision 1.0 - 2007: James S. Plank.
- */
+Revision 1.2A
+May 24, 2011
+
+James S. Plank
+Department of Electrical Engineering and Computer Science
+University of Tennessee
+Knoxville, TN 37996
+plank@cs.utk.edu
+
+Copyright (c) 2011, James S. Plank
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+ - Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+
+ - Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in
+   the documentation and/or other materials provided with the
+   distribution.
+
+ - Neither the name of the University of Tennessee nor the names of its
+   contributors may be used to endorse or promote products derived
+   from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
+AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY
+WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
+
+*/
 
 /* 
 This program takes as input an inputfile, k, m, a coding
@@ -76,9 +79,9 @@ same arguments, and encoder.c does error check.
 #include "timing.h"
 
 #define N 10
+#define ALIGN_SIZE 64
 
 enum Coding_Technique {Reed_Sol_Van, Reed_Sol_R6_Op, Cauchy_Orig, Cauchy_Good, Liberation, Blaum_Roth, Liber8tion, RDP, EVENODD, No_Coding};
-
 char *Methods[N] = {"reed_sol_van", "reed_sol_r6_op", "cauchy_orig", "cauchy_good", "liberation", "blaum_roth", "liber8tion", "rdp", "evenodd", "no_coding"};
 
 /* Global variables for signal handler */
@@ -106,8 +109,8 @@ int main (int argc, char **argv) {
 	
 	int i, j;				// loop control variable, s
 	int blocksize = 0;			// size of individual files
-	int origsize;			// size of file before padding
-	int total;				// used to write data, not padding to file
+	long origsize;			// size of file before padding
+	long total;				// used to write data, not padding to file
 	struct stat status;		// used to find size of individual files
 	int numerased;			// number of erased files
 		
@@ -119,10 +122,9 @@ int main (int argc, char **argv) {
 	char *curdir;
 
 	/* Used to time decoding */
-	struct timing t1, t2, t3, t4;
+	struct timespec t1, t2, t3, t4;
 	double tsec;
 	double totalsec;
-
 	
 	signal(SIGQUIT, ctrl_bs_handler);
 
@@ -131,7 +133,7 @@ int main (int argc, char **argv) {
 	totalsec = 0.0;
 	
 	/* Start timing */
-	timing_set(&t1);
+	clock_gettime(CLOCK_REALTIME, &t1);
 
 	/* Error checking parameters */
 	if (argc != 2) {
@@ -174,7 +176,7 @@ int main (int argc, char **argv) {
 		exit(0);
 	}
 	
-	if (fscanf(fp, "%d", &origsize) != 1) {
+	if (fscanf(fp, "%ld", &origsize) != 1) {
 		fprintf(stderr, "Original size is not valid\n");
 		exit(0);
 	}
@@ -208,17 +210,25 @@ int main (int argc, char **argv) {
 	coding = (char **)malloc(sizeof(char *)*m);
 	if (buffersize != origsize) {
 		for (i = 0; i < k; i++) {
-			data[i] = (char *)malloc(sizeof(char)*(buffersize/k));
+			// data[i] = (char *)malloc(sizeof(char)*(buffersize/k));
+			if (posix_memalign((void **) &data[i], ALIGN_SIZE, sizeof(char)*(buffersize/k))) {
+				perror("posix_memalign"); 
+				exit(1);
+			}
 		}
 		for (i = 0; i < m; i++) {
-			coding[i] = (char *)malloc(sizeof(char)*(buffersize/k));
+			// coding[i] = (char *)malloc(sizeof(char)*(buffersize/k));
+			if (posix_memalign((void **) &coding[i], ALIGN_SIZE, sizeof(char)*(buffersize/k))) {
+				perror("posix_memalign"); 
+				exit(1);
+			}
 		}
 		blocksize = buffersize/k;
 	}
 
 	sprintf(temp, "%d", k);
 	md = strlen(temp);
-	timing_set(&t3);
+	clock_gettime(CLOCK_REALTIME, &t3);
 
 	/* Create coding matrix or bitmatrix */
 	switch(tech) {
@@ -247,7 +257,7 @@ int main (int argc, char **argv) {
 		case Liber8tion:
 			bitmatrix = liber8tion_coding_bitmatrix(k);
 	}
-	timing_set(&t4);
+	clock_gettime(CLOCK_REALTIME, &t4);
 	totalsec += timing_delta(&t3, &t4);
 	
 	/* Begin decoding process */
@@ -269,7 +279,11 @@ int main (int argc, char **argv) {
 				if (buffersize == origsize) {
 					stat(fname, &status);
 					blocksize = status.st_size;
-					data[i-1] = (char *)malloc(sizeof(char)*blocksize);
+					// data[i-1] = (char *)malloc(sizeof(char)*blocksize);
+					if (posix_memalign((void **) &data[i-1], ALIGN_SIZE, sizeof(char)*blocksize)) {
+						perror("posix_memalign"); 
+						exit(1);
+					}
 					assert(blocksize == fread(data[i-1], sizeof(char), blocksize, fp));
 				}
 				else {
@@ -292,7 +306,11 @@ int main (int argc, char **argv) {
 				if (buffersize == origsize) {
 					stat(fname, &status);
 					blocksize = status.st_size;
-					coding[i-1] = (char *)malloc(sizeof(char)*blocksize);
+					// coding[i-1] = (char *)malloc(sizeof(char)*blocksize);
+					if (posix_memalign((void **) &coding[i-1], ALIGN_SIZE, sizeof(char)*blocksize)) {
+						perror("posix_memalign"); 
+						exit(1);
+					}
 					assert(blocksize == fread(coding[i-1], sizeof(char), blocksize, fp));
 				}
 				else {
@@ -306,16 +324,24 @@ int main (int argc, char **argv) {
 		if (n == 1) {
 			for (i = 0; i < numerased; i++) {
 				if (erasures[i] < k) {
-					data[erasures[i]] = (char *)malloc(sizeof(char)*blocksize);
+					// data[erasures[i]] = (char *)malloc(sizeof(char)*blocksize);
+					if (posix_memalign((void **) &data[erasures[i]], ALIGN_SIZE, sizeof(char)*blocksize)) {
+						perror("posix_memalign"); 
+						exit(1);
+					}
 				}
 				else {
-					coding[erasures[i]-k] = (char *)malloc(sizeof(char)*blocksize);
+					// coding[erasures[i]-k] = (char *)malloc(sizeof(char)*blocksize);
+					if (posix_memalign((void **) &coding[erasures[i]-k], ALIGN_SIZE, sizeof(char)*blocksize)) {
+						perror("posix_memalign"); 
+						exit(1);
+					}
 				}
 			}
 		}
 		
 		erasures[numerased] = -1;
-		timing_set(&t3);
+		clock_gettime(CLOCK_REALTIME, &t3);
 	
 		/* Choose proper decoding method */
 		if (tech == Reed_Sol_Van || tech == Reed_Sol_R6_Op) {
@@ -328,7 +354,7 @@ int main (int argc, char **argv) {
 			fprintf(stderr, "Not a valid coding technique.\n");
 			exit(0);
 		}
-		timing_set(&t4);
+		clock_gettime(CLOCK_REALTIME, &t4);
 	
 		/* Exit if decoding was unsuccessful */
 		if (i == -1) {
@@ -377,10 +403,10 @@ int main (int argc, char **argv) {
 	free(erased);
 	
 	/* Stop timing and print time */
-	timing_set(&t2);
+	clock_gettime(CLOCK_REALTIME, &t2);
 	tsec = timing_delta(&t1, &t2);
 	printf("Decoding (MB/sec): %0.10f\n", (((double) origsize)/1024.0/1024.0)/totalsec);
-	printf("De_Total (MB/sec): %0.10f\n\n", (((double) origsize)/1024.0/1024.0)/tsec);
+	printf("De_Total (MB/sec): %0.10f\n", (((double) origsize)/1024.0/1024.0)/tsec);
 
 	return 0;
 }	

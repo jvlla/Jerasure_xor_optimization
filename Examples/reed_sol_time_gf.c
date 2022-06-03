@@ -52,6 +52,7 @@
 #include <gf_rand.h>
 #include <gf_method.h>
 #include <stdint.h>
+#include <time.h>
 #include "jerasure.h"
 #include "reed_sol.h"
 #include "timing.h"
@@ -107,7 +108,8 @@ int main(int argc, char **argv)
   char **data, **coding, **old_values;
   int *erasures, *erased;
   uint32_t seed;
-  double t = 0, total_time = 0;
+  struct timespec t1, t2;
+  double total_time = 0;
   gf_t *gf = NULL;
   
   if (argc < 8) usage(NULL);  
@@ -157,9 +159,10 @@ int main(int argc, char **argv)
   }
 
   for (i = 0; i < iterations; i++) {
-    t = timing_now();
+    clock_gettime(CLOCK_REALTIME, &t1);
     jerasure_matrix_encode(k, m, w, matrix, data, coding, bufsize);
-    total_time += timing_now() - t;
+    clock_gettime(CLOCK_REALTIME, &t2);
+    total_time += timing_delta(&t1, &t2);
   }
 
   printf("Encode throughput for %d iterations: %.2f MB/s (%.2f sec)\n", iterations, (double)(k*iterations*bufsize/1024/1024) / total_time, total_time);
@@ -179,9 +182,10 @@ int main(int argc, char **argv)
   erasures[i] = -1;
 
   for (i = 0; i < iterations; i++) {
-    t = timing_now();
+    clock_gettime(CLOCK_REALTIME, &t1);
     jerasure_matrix_decode(k, m, w, matrix, 1, erasures, data, coding, bufsize);
-    total_time += timing_now() - t;
+    clock_gettime(CLOCK_REALTIME, &t2);
+    total_time += timing_delta(&t1, &t2);
   }
   
   printf("Decode throughput for %d iterations: %.2f MB/s (%.2f sec)\n", iterations, (double)(k*iterations*bufsize/1024/1024) / total_time, total_time);
